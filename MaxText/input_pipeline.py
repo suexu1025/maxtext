@@ -193,6 +193,39 @@ def get_datasets(
 
   return train_ds, eval_ds
 
+
+def get_lg_datasets(
+  config: ml_collections.ConfigDict,
+  read_config = None,
+):
+  """Load and return dataset of batched examples for use during training."""
+  # Training dataset.
+  lg_dataset_path = config.dataset_path
+  train_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_train_data) 
+
+  def parse_example(example_proto):  
+    feature_description = {  
+        'text': tf.io.VarLenFeature(tf.int64),  
+        # Add more features as needed  
+    }  
+    parsed_example = tf.io.parse_single_example(example_proto, feature_description)  
+    return parsed_example 
+
+  train_ds = train_ds.map(parse_example) 
+  # shard the dataset as soon as it is loaded
+  train_ds = train_ds.shard(num_shards = jax.process_count(), index = jax.process_index())
+  train_ds = normalize_features(train_ds)
+
+  # Evaluation dataset.
+  if config.file_pattern_for_eval_data:
+    eval_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_eval_data) 
+    eval_ds = eval_ds.map(parse_example)
+    eval_ds = eval_ds.shard(num_shards = jax.process_count(), index = jax.process_index())
+    eval_ds = normalize_features(eval_ds)
+  else:
+    eval_ds = train_ds
+
+
 def preprocess_dataset(config: ml_collections.ConfigDict,
                         global_mesh,
                         train_ds, eval_ds,
@@ -261,6 +294,77 @@ def preprocess_dataset(config: ml_collections.ConfigDict,
       data_shuffle_seed = data_shuffle_seed,)
 
   return train_iter, eval_iter, predict_iter, sp_tokenizer
+
+def preprocess_lg_dataset(config: ml_collections.ConfigDict,
+                        global_mesh,
+                        train_ds, eval_ds,
+                        vocab_path: Optional[str] = None,
+                        data_shuffle_seed = 0,):
+  """Pre-process the dataset and return iterators"""
+  
+  # Skipping tokenizer since the data in hand is already tokenized
+  # if vocab_path is None:
+  #   vocab_path = os.path.expanduser('~/lm1b_sentencepiece_model')
+
+  # # Load tokenizer
+  # sp_tokenizer = tokenizer.load_tokenizer(vocab_path=vocab_path,
+  #                                         vocab_size=config.vocab_size)
+
+  # # Tokenize data.
+  # train_ds = train_ds.map(
+  #     tokenizer.TokenizeOp(sp_tokenizer), num_parallel_calls=AUTOTUNE)
+  # eval_ds = eval_ds.map(
+  #     tokenizer.TokenizeOp(sp_tokenizer), num_parallel_calls=AUTOTUNE)
+
+  # Set global batch size.
+  global_batch_size_to_load = config.global_batch_size_to_load
+
+  if config.eval_per_device_batch_size > 0:
+    eval_batch_size = config.eval_per_device_batch_size * global_mesh.size
+  else:
+    eval_batch_size = global_batch_size_to_load
+
+  def filter_keys(record):
+    return {'inputs': record['inputs'], 'targets': record['targets']}
+  train_ds = train_ds.map(filter_keys,num_parallel_calls=tf.data.AUTOTUNE)
+  eval_ds = eval_ds.map(filter_keys,num_parallel_calls=tf.data.AUTOTUNE)
+
+  train_iter = preprocessing_pipeline(
+      train_ds,
+      global_batch_size_to_load,
+      global_mesh,
+      shuffle=config.enable_data_shuffling,
+      num_epochs=None,
+      pack_examples=True,
+      max_length=config.max_target_length,
+      shift=True,
+      data_sharding = config.data_sharding,
+      data_shuffle_seed = data_shuffle_seed,)
+
+  eval_iter = preprocessing_pipeline(
+      eval_ds,
+      eval_batch_size,
+      global_mesh,
+      shuffle=config.enable_data_shuffling,
+      pack_examples=False,
+      max_length=config.max_eval_target_length,
+      shift=False,
+      data_sharding = config.data_sharding,
+      data_shuffle_seed = data_shuffle_seed,)
+
+  predict_iter = preprocessing_pipeline(
+      eval_ds,
+      eval_batch_size,
+      global_mesh,
+      shuffle=config.enable_data_shuffling,
+      pack_examples=False,
+      max_length=config.max_predict_length,
+      shift=False,
+      drop_remainder=False,
+      data_sharding = config.data_sharding,
+      data_shuffle_seed = data_shuffle_seed,)
+
+  return train_iter, eval_iter, predict_iter#, sp_tokenizer
 
 
 def make_c4_train_iterator_and_tokenizer(config, mesh):

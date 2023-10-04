@@ -13,5 +13,5 @@
 # limitations under the License.
 
 export LIBTPU_INIT_ARGS="--xla_enable_async_all_gather=true TPU_MEGACORE=MEGACORE_DENSE"
-python3 MaxText/train.py MaxText/configs/base.yml run_name=1xv3-32 dcn_data_parallelism=1 ici_data_parallelism=2 ici_tensor_parallelism=16 steps=10 enable_profiler=true remat_policy=full base_emb_dim=4*1024 base_num_heads=64 head_dim=64 base_mlp_dim= vocab_size=50272 base_num_decoder_layers=16 per_device_batch_size=0.5 
+python3 MaxText/train.py MaxText/configs/base.yml run_name=1xv3-32 dcn_data_parallelism=1 ici_data_parallelism=2 ici_tensor_parallelism=16 steps=10 enable_profiler=true remat_policy=full base_emb_dim=4*1024 base_num_heads=64 head_dim=64 vocab_size=50272 base_num_decoder_layers=16 per_device_batch_size=0.5 file_pattern_for_train_data="gs://yejingxin-us-central2/external/lg/dummy-data/train/*.tfrecords" file_pattern_for_eval_data="gs://yejingxin-us-central2/external/lg/dummy-data/valid/*.tfrecords"
 # TFLOP/s 165, 22B

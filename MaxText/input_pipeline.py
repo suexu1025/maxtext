@@ -30,6 +30,8 @@ import tokenizer
 import multihost_dataloading
 import sequence_packing
 
+import max_logging
+
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
 
@@ -149,7 +151,10 @@ def preprocessing_pipeline(
     dataset = dataset.padded_batch(
         batch_size // jax.process_count(),
         padded_shapes={'inputs': max_length, 'targets': max_length},
-        padding_values={'inputs': 0, 'targets': 0},
+        # padding_values={'inputs': 0, 'targets': 0},
+        #padding with int64 since input component is int64
+        #TODO:Anisha: generalize this padding data type
+        padding_values={'inputs': tf.constant(0, dtype=tf.int64), 'targets': tf.constant(0, dtype=tf.int64)},
         drop_remainder=drop_remainder)
 
   if prefetch_size:
@@ -200,30 +205,45 @@ def get_lg_datasets(
 ):
   """Load and return dataset of batched examples for use during training."""
   # Training dataset.
-  lg_dataset_path = config.dataset_path
-  train_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_train_data) 
+  # lg_dataset_path = config.dataset_path
+  max_logging.log(f"Trying to read training data from path: {config.file_pattern_for_train_data}")
+  # train_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_train_data) 
+  # train_ds = train_ds.map(tf.data.TFRecordDataset)
+  # train_ds = tf.data.TFRecordDataset(config.file_pattern_for_train_data)
+  train_ds = tf.data.TFRecordDataset(tf.data.Dataset.list_files(config.file_pattern_for_train_data))
 
-  def parse_example(example_proto):  
-    feature_description = {  
-        'text': tf.io.VarLenFeature(tf.int64),  
-        # Add more features as needed  
-    }  
-    parsed_example = tf.io.parse_single_example(example_proto, feature_description)  
+  def parse_example(example_proto, is_train):
+    max_seq_length = config.max_target_length if is_train else config.max_eval_target_length
+    output = [('text', tf.io.VarLenFeature(tf.int64))]
+    feature_description = dict(output)
+    parsed_example = tf.io.parse_single_example(example_proto, feature_description)
+    parsed_example["text"] = tf.sparse.to_dense(parsed_example["text"])  
     return parsed_example 
 
-  train_ds = train_ds.map(parse_example) 
+  max_logging.log(f"Training dataset has: {train_ds.cardinality()} entries" )
+  parse_example_partial = functools.partial(parse_example, is_train=True)
+  train_ds = train_ds.map(parse_example_partial) 
   # shard the dataset as soon as it is loaded
   train_ds = train_ds.shard(num_shards = jax.process_count(), index = jax.process_index())
   train_ds = normalize_features(train_ds)
 
   # Evaluation dataset.
   if config.file_pattern_for_eval_data:
-    eval_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_eval_data) 
-    eval_ds = eval_ds.map(parse_example)
+    max_logging.log(f"Trying to read eval data from path: {config.file_pattern_for_eval_data}")
+    # eval_ds = tf.data.TFRecordDataset.list_files(config.file_pattern_for_eval_data) 
+    # eval_ds = eval_ds.map(tf.data.TFRecordDataset)
+    # eval_ds = tf.data.TFRecordDataset(config.file_pattern_for_eval_data)
+    eval_ds = tf.data.TFRecordDataset(tf.data.Dataset.list_files(config.file_pattern_for_eval_data))
+    max_logging.log(f"Eval dataset has: {eval_ds.cardinality()} entries")
+    parse_example_partial = functools.partial(parse_example, is_train=False)
+    eval_ds = eval_ds.map(parse_example_partial)
     eval_ds = eval_ds.shard(num_shards = jax.process_count(), index = jax.process_index())
     eval_ds = normalize_features(eval_ds)
   else:
     eval_ds = train_ds
+    max_logging.log(f"Reusing training dataset as eval dataset")
+
+  return train_ds, eval_ds
 
 
 def preprocess_dataset(config: ml_collections.ConfigDict,
@@ -366,7 +386,6 @@ def preprocess_lg_dataset(config: ml_collections.ConfigDict,
 
   return train_iter, eval_iter, predict_iter#, sp_tokenizer
 
-
 def make_c4_train_iterator_and_tokenizer(config, mesh):
   """ Make train iterator and tokenizer for C4 dataset"""
   read_config = tfds.ReadConfig(
@@ -384,6 +403,25 @@ def make_c4_train_iterator_and_tokenizer(config, mesh):
     data_shuffle_seed = config.data_shuffle_seed,
   )
   return train_iter, sp_tokenizer
+
+def make_lg_train_iterator_and_tokenizer(config, mesh):
+  """ Make train iterator and tokenizer for C4 dataset"""
+  read_config = tfds.ReadConfig(
+    shuffle_seed = config.data_shuffle_seed,
+  )
+  # train_ds, eval_ds = get_datasets(
+  train_ds, eval_ds = get_lg_datasets(
+    config=config,
+    read_config = read_config,
+  )
+  train_iter, _, _ = preprocess_lg_dataset(
+    config,
+    mesh,
+    train_ds, eval_ds,
+    vocab_path=os.path.join(config.assets_path, config.vocab_relative_path),
+    data_shuffle_seed = config.data_shuffle_seed,
+  )
+  return train_iter
 
 class SyntheticDataIterator():
   """Creates a synthetic data iterator for performance testing work"""
@@ -423,5 +461,7 @@ def create_data_iterator_with_tokenizer(config, mesh):
     return SyntheticDataIterator(config, mesh), None
   elif config.dataset_type == "c4":
     return make_c4_train_iterator_and_tokenizer(config, mesh)
+  elif config.dataset_type == "lg":
+    return make_lg_train_iterator_and_tokenizer(config, mesh)
   else:
     assert False, "dataset type not implemented"

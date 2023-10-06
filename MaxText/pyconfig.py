@@ -92,7 +92,11 @@ class _HyperParameters():
     base_output_directory = raw_keys["base_output_directory"]
     validate_gcs_bucket_name(base_output_directory, "base_output_directory")
     dataset_path = raw_keys["dataset_path"]
-    validate_gcs_bucket_name(dataset_path, "dataset_path")
+    # validate_gcs_bucket_name(dataset_path, "dataset_path")
+    #Let us validate the training dataset path
+    validate_gcs_bucket_name(raw_keys["file_pattern_for_train_data"], "file_pattern_for_train_data")
+    #Not validating eval data path since it is optional
+    # validate_gcs_bucket_name(raw_keys["file_pattern_for_train_data"], "file_pattern_for_train_data")
     assert ((raw_keys["load_parameters_path"]=="" and raw_keys["load_from_other_directory"]=="") or
       raw_keys["enable_checkpointing"]), "You must set enable_checkpointing to load a checkpoint"
     assert raw_keys["load_parameters_path"]=="" or raw_keys["load_from_other_directory"]=="" \
@@ -119,6 +123,8 @@ class _HyperParameters():
 
     raw_keys['global_batch_size_to_load'], raw_keys['global_batch_size_to_train_on'] = \
       calculate_global_batch_sizes(raw_keys['per_device_batch_size'])
+    
+    file_pattern_for_train_data = raw_keys['file_pattern_for_train_data']
 
 def validate_gcs_bucket_name(bucket_name, config_var):
   assert bucket_name, f"Please set {config_var}."

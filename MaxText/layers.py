@@ -160,8 +160,8 @@ def dot_product_attention(query: Array,
   # Layer norms here prevent (near) one-hot softmaxes, which can lead to
   # unstable training loss and nans, see the "QK Normalization" subsection in
   # https://arxiv.org/pdf/2302.05442.pdf.
-  query = LayerNorm(dtype=dtype, name='query_layer_norm', kernel_axes = ('heads',))(query)
-  key = LayerNorm(dtype=dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
+  # query = LayerNorm(dtype=dtype, name='query_layer_norm', kernel_axes = ('heads',))(query)
+  # key = LayerNorm(dtype=dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
 
   # QK Product, a.k.a `attn_weights`: [batch, num_heads, q_length, kv_length]
   attn_weights = compute_qk_attn_weights(query, key, cfg, aqt_rng)
@@ -475,7 +475,7 @@ class MultiHeadDotProductAttention(nn.Module):
         expected_shape = (batch, 1, num_heads, head_dim)
         if expected_shape != query.shape:
           raise ValueError(f"""Autoregressive cache shape error,
-                           expected query shape %s instead got 
+                           expected query shape %s instead got
                            {(expected_shape, query.shape)}""")
         # Create a OHE of the current index. NOTE: the index is increased below.
         cur_index = cache_index.value

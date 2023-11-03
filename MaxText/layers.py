@@ -1093,6 +1093,8 @@ class DecoderLayer(nn.Module):
             deterministic=deterministic,
             decode=decode)
     attention_lnx = nn.with_logical_constraint(attention_lnx, ('activation_batch', 'activation_length', 'activation_embed'))
+    attention_lnx = LayerNorm(dtype=cfg.dtype, name='pre_mlp_layer_norm')(attention_lnx)
+
 
     # MLP block.
     mlp_lnx = MlpBlock(

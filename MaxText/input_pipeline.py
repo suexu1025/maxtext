@@ -198,6 +198,12 @@ def get_datasets(
 
   return train_ds, eval_ds
 
+def count_records_dataset(tfRecordDataset):
+  """Count the number of records in a TFRecordDataset."""
+  count = 0
+  for record in tfRecordDataset:
+      count += 1
+  return count
 
 def get_lg_datasets(
   config: ml_collections.ConfigDict,
@@ -220,7 +226,7 @@ def get_lg_datasets(
     parsed_example["text"] = tf.sparse.to_dense(parsed_example["text"])  
     return parsed_example 
 
-  max_logging.log(f"Training dataset has: {train_ds.cardinality()} entries" )
+  max_logging.log(f"Training dataset has: {count_records_dataset(train_ds)} entries" )
   parse_example_partial = functools.partial(parse_example, is_train=True)
   train_ds = train_ds.map(parse_example_partial) 
   # shard the dataset as soon as it is loaded
@@ -234,7 +240,7 @@ def get_lg_datasets(
     # eval_ds = eval_ds.map(tf.data.TFRecordDataset)
     # eval_ds = tf.data.TFRecordDataset(config.file_pattern_for_eval_data)
     eval_ds = tf.data.TFRecordDataset(tf.data.Dataset.list_files(config.file_pattern_for_eval_data))
-    max_logging.log(f"Eval dataset has: {eval_ds.cardinality()} entries")
+    max_logging.log(f"Eval dataset has: {count_records_dataset(eval_ds)} entries")
     parse_example_partial = functools.partial(parse_example, is_train=False)
     eval_ds = eval_ds.map(parse_example_partial)
     eval_ds = eval_ds.shard(num_shards = jax.process_count(), index = jax.process_index())
@@ -405,7 +411,7 @@ def make_c4_train_iterator_and_tokenizer(config, mesh):
   return train_iter, sp_tokenizer
 
 def make_lg_train_iterator_and_tokenizer(config, mesh):
-  """ Make train iterator and tokenizer for C4 dataset"""
+  """ Make train iterator and tokenizer for lg dataset"""
   read_config = tfds.ReadConfig(
     shuffle_seed = config.data_shuffle_seed,
   )

@@ -19,11 +19,9 @@
 # pylint: disable=no-name-in-module
 
 from aqt.jax.v2 import aqt_dot_general as aqt
-from aqt.jax.v2 import aqt_dq_dot_general as aqt_dq
-from aqt.jax.v2.google import aqt_config
+from aqt.jax.v2.config import config_v3
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 import functools
 import operator
@@ -40,8 +38,7 @@ from jax import lax
 from jax import random
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
-if jax.__version__ >= '0.4.16':
-  from jax.experimental.pallas.ops.tpu import flash_attention
+from jax.experimental.pallas.ops.tpu import flash_attention
 
 
 
@@ -65,7 +62,18 @@ NdInitializer = Callable[
 default_embed_init = nn.initializers.variance_scaling(
     1.0, 'fan_in', 'normal', out_axis=0)
 
-
+def get_aqt_cfg():
+  return config_v3(
+    fwd_bits=8,
+    dlhs_bits=8,
+    drhs_bits=None,
+    rng_type='jax.uniform',
+    dlhs_local_aqt = None,
+    drhs_local_aqt = None,
+    fwd_accumulator_dtype = jnp.int32,
+    dlhs_accumulator_dtype = jnp.int32,
+    drhs_accumulator_dtype = jnp.int32,
+  )
 #------------------------------------------------------------------------------
 # Dot product attention layer.
 #------------------------------------------------------------------------------
@@ -116,37 +124,16 @@ def dot_product_attention(query: Array,
   assert key.shape[-3] == value.shape[-3], 'k, v lengths must match.'
   assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'
 
-  def compute_qk_attn_weights(query, key, cfg, aqt_rng):
+  def compute_qk_attn_weights(query, key):
     """Computes all query-key dot product pairs"""
-    if not cfg.int8_training:
-      attn_weights = jnp.einsum('bqhd,bkhd->bhqk', query, key)
-    else:
-      aqt_cfg = aqt_config.quantization_config(
-        cfg.fwd_int8_qk,
-        cfg.dlhs_int8_qk,
-        cfg.drhs_int8_qk,
-        use_fwd_quant=cfg.aqt_use_fwd_quant,
-        use_dummy_static_bound=cfg.aqt_use_dummy_static_bound,
-        rng_type=cfg.aqt_rng_type
-      )
-      aqt_dot_general = aqt.make_dot_general(aqt_cfg)
-      context = aqt.Context(key=aqt_rng, train_step=None)
-      aqt_dot_general = functools.partial(aqt_dot_general, context=context)
-      attn_weights = jnp.einsum('bqhd,bkhd->bhqk', query, key, _dot_general=aqt_dot_general)
-    return attn_weights
+    return jnp.einsum('bqhd,bkhd->bhqk', query, key)
 
   def compute_weighted_values(attn_weights, value, cfg, aqt_rng):
     """Computes attn_weights * values"""
     if not cfg.int8_training:
       weighted_values = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, value)
     else:
-      aqt_cfg = aqt_config.quantization_config(cfg.fwd_int8_pv,
-        cfg.dlhs_int8_pv,
-        cfg.drhs_int8_pv,
-        use_fwd_quant=cfg.aqt_use_fwd_quant,
-        use_dummy_static_bound=cfg.aqt_use_dummy_static_bound,
-        rng_type=cfg.aqt_rng_type,
-      )
+      aqt_cfg = get_aqt_cfg()
       aqt_dot_general = aqt.make_dot_general(aqt_cfg)
       context = aqt.Context(key=aqt_rng, train_step=None)
       aqt_dot_general = functools.partial(aqt_dot_general, context=context)
@@ -164,7 +151,7 @@ def dot_product_attention(query: Array,
   key = LayerNorm(dtype=dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
 
   # QK Product, a.k.a `attn_weights`: [batch, num_heads, q_length, kv_length]
-  attn_weights = compute_qk_attn_weights(query, key, cfg, aqt_rng)
+  attn_weights = compute_qk_attn_weights(query, key)
 
   # Apply attention bias: masking, dropout, proximity bias, etc.
   if bias is not None:
@@ -251,21 +238,10 @@ class DenseGeneral(nn.Module):
         return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
       else:
         aqt_key = self.make_rng('aqt')
-        if cfg.use_dqdg:
-          aqt_dq_dg = aqt_dq.make_aqt_dq_dg()
-          return aqt_dq_dg(aqt_key, inputs, kernel, ((axis, contract_ind), ((), ())))
-        else:
-          aqt_cfg = aqt_config.quantization_config(
-            cfg.fwd_int8,
-            cfg.dlhs_int8,
-            cfg.drhs_int8,
-            use_dummy_static_bound=cfg.aqt_use_dummy_static_bound,
-            rng_type=cfg.aqt_rng_type,
-            use_fwd_quant=cfg.aqt_use_fwd_quant,
-          )
-          aqt_dot_general = aqt.make_dot_general(aqt_cfg)
-          context = aqt.Context(key=aqt_key, train_step=None)
-          return aqt_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), context=context)
+        aqt_cfg = get_aqt_cfg()
+        aqt_dot_general = aqt.make_dot_general(aqt_cfg)
+        context = aqt.Context(key=aqt_key, train_step=None)
+        return aqt_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), context=context)
 
     cfg = self.config
     features = _canonicalize_tuple(self.features)
@@ -328,40 +304,49 @@ class MultiHeadDotProductAttention(nn.Module):
 
 
   def apply_attention(self, query, key, value, enable_flash_attention,
-                      attention_bias, dropout_rng, deterministic):
+                      decoder_segment_ids, attention_bias, dropout_rng, deterministic, decode):
     """ Apply Attention
     """
-    if enable_flash_attention:
+    if enable_flash_attention and not decode:
+      query = LayerNorm(dtype=self.dtype, name='query_layer_norm', kernel_axes = ('heads',))(query)
+      key = LayerNorm(dtype=self.dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
       # reshaped to ('batch', 'heads', 'length', 'kv')
       query = jax.numpy.transpose(query, axes = (0,2,1,3))
       key = jax.numpy.transpose(key, axes = (0,2,1,3))
       value = jax.numpy.transpose(value, axes = (0,2,1,3))
+      if decoder_segment_ids is not None:
+        decoder_segment_ids = flash_attention.SegmentIds(decoder_segment_ids, decoder_segment_ids)
+      axis_names = nn.logical_to_mesh_axes(('activation_batch', 'activation_heads', 'activation_length', 'activation_kv'))
+      segment_axis_names = nn.logical_to_mesh_axes(('activation_batch', 'activation_length'))
       @functools.partial(shard_map, mesh = self.mesh, in_specs = (
-          P(('data','fsdp'),'tensor'),
-          P(('data','fsdp'),'tensor'),
-          P(('data','fsdp'),'tensor'),
-      ), out_specs = P(('data','fsdp'),'tensor'), check_rep=False)
-      def wrap_flash_attention(query, key, value):
+          axis_names,
+          axis_names,
+          axis_names,
+          segment_axis_names,
+      ), out_specs = axis_names, check_rep=False)
+      def wrap_flash_attention(query, key, value, decoder_segment_ids):
         return flash_attention.flash_attention(
               query,
               key,
               value,
-              causal = False,
+              causal = True,
+              segment_ids = decoder_segment_ids,
               block_sizes = flash_attention.BlockSizes(
-                  block_q=512,
-                  block_k_major=512,
-                  block_k=512,
-                  block_b=1,
-                  block_q_major_dkv=512,
-                  block_k_major_dkv=512,
-                  block_k_dkv=512,
-                  block_q_dkv=512,
-                  block_k_major_dq=512,
-                  block_k_dq=512,
-                  block_q_dq=512,
+                block_q=min(512, self.config.max_target_length),
+                block_k_major=min(512, self.config.max_target_length),
+                block_k=min(512, self.config.max_target_length),
+                block_b=2,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_q_dkv=512,
+                block_k_dkv=512,
+                block_q_dq=1024,
+                block_k_dq=256,
+                block_k_major_dq=512,
+
               )
             )
-      x = wrap_flash_attention(query, key, value)
+      x = wrap_flash_attention(query, key, value, decoder_segment_ids)
       x = jax.numpy.transpose(x, axes = (0,2,1,3))
     else:
       aqt_rng = self.make_rng('aqt')
@@ -383,6 +368,9 @@ class MultiHeadDotProductAttention(nn.Module):
   def __call__(self,
                inputs_q: Array,
                inputs_kv: Array,
+               enable_flash_attention,
+               decoder_segment_ids = None,
+               inputs_positions:Optional[Array] = None,
                mask: Optional[Array] = None,
                bias: Optional[Array] = None,
                *,
@@ -440,6 +428,15 @@ class MultiHeadDotProductAttention(nn.Module):
     key = projection(kernel_init=self.kernel_init, name='key')(inputs_kv)
     value = projection(kernel_init=self.kernel_init, name='value')(inputs_kv)
 
+    #Apply RoPE
+    query = LLaMARotaryEmbedding(embedding_dims=self.head_dim,
+                                 name='query_rotary'
+                                 )(inputs=query, position=inputs_positions)
+    key = LLaMARotaryEmbedding(embedding_dims=self.head_dim,
+                               name='key_rotary'
+                               )(inputs=key, position=inputs_positions)
+
+
     query = nn.with_logical_constraint(
         query, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv')
     )
@@ -475,7 +472,7 @@ class MultiHeadDotProductAttention(nn.Module):
         expected_shape = (batch, 1, num_heads, head_dim)
         if expected_shape != query.shape:
           raise ValueError(f"""Autoregressive cache shape error,
-                           expected query shape %s instead got 
+                           expected query shape %s instead got
                            {(expected_shape, query.shape)}""")
         # Create a OHE of the current index. NOTE: the index is increased below.
         cur_index = cache_index.value
@@ -540,7 +537,11 @@ class MultiHeadDotProductAttention(nn.Module):
       dropout_rng = self.make_rng('dropout')
 
     # Apply attention.
-    x = self.apply_attention(query, key, value, cfg.enable_flash_attention, attention_bias, dropout_rng, deterministic)
+    x = self.apply_attention(query, key, value, enable_flash_attention,
+                              decoder_segment_ids, attention_bias, dropout_rng, deterministic, decode=decode)
+    x = nn.with_logical_constraint(
+        x, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv')
+    )
 
     # Back to the original inputs dimensions.
     out = DenseGeneral(
@@ -712,121 +713,86 @@ class Embed(nn.Module):
     dtype = self.attend_dtype if self.attend_dtype is not None else self.dtype
     return jnp.dot(query, jnp.asarray(self.embedding, dtype).T)
 
-
-class RelativePositionBiases(nn.Module):
-  """Adds T5-style relative positional embeddings to the attention logits.
+class LLaMARotaryEmbedding(nn.Module):
+  """LLaMA variant of ROPE where inputs are split in a different way.
 
   Attributes:
-    num_buckets: Number of buckets to bucket distances between key and query
-      positions into.
-    max_distance: Maximum distance before everything is lumped into the last
-      distance bucket.
-    num_heads: Number of heads in the attention layer. Each head will get a
-      different relative position weighting.
-    dtype: Type of arrays through this module.
-    embedding_init: initializer for relative embedding table.
+    min_timescale: Start of the geometric index. Determines the periodicity of
+      the added signal.
+    max_timescale: End of the geometric index. Determines the frequency of the
+      added signal.
+    embedding_dims: Dimension of the embedding to be generated.
   """
-  num_buckets: int
-  max_distance: int
-  num_heads: int
-  dtype: Any
-  embedding_init: Callable[..., Array] = nn.linear.default_embed_init
+  min_timescale: int = 1
+  max_timescale: int = 10_000
+  embedding_dims: int = 0
+  cast_as_fprop_dtype: bool = True
+  fprop_dtype: DType = jnp.bfloat16
 
-  @staticmethod
-  def _relative_position_bucket(relative_position,
-                                bidirectional=True,
-                                num_buckets=32,
-                                max_distance=128):
-    """Translate relative position to a bucket number for relative attention.
+  def setup(self) -> None:
+    if self.embedding_dims % 2:
+      raise ValueError(
+          'Embedding dim for rotary position embedding must be a multiple of 2.'
+      )
 
-    The relative position is defined as memory_position - query_position, i.e.
-    the distance in tokens from the attending position to the attended-to
-    position.  If bidirectional=False, then positive relative positions are
-    invalid.
-    We use smaller buckets for small absolute relative_position and larger
-    buckets for larger absolute relative_positions.  All relative
-    positions >=max_distance  map to the same bucket.  All relative
-    positions <=-max_distance map to the same bucket.  This should allow for
-    more graceful generalization to longer sequences than the model has been
-    trained on.
+  def __call__(
+      self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
+      inputs: jax.Array,
+      position: Optional[jax.Array] = None,
+  ) -> jax.Array:
+    """Generates a jax.Array of sinusoids with different frequencies.
 
     Args:
-      relative_position: an int32 array
-      bidirectional: a boolean - whether the attention is bidirectional
-      num_buckets: an integer
-      max_distance: an integer
+      inputs: The input sequence on which to apply the Rotary position
+        embedding. Since rotary position embeddings are applied to query and
+        keys after projection, it is assumed of shape [B, S, N, H].
+      position: Optional position jax.Array which denotes the position of each
+        token in the sequence. This only needs to be supplied when the sequence
+        is packed. It is of shape [B, S].
 
     Returns:
-      a Tensor with the same shape as relative_position, containing int32
-        values in the range [0, num_buckets)
+      a jax.Array of shape [B, S, N, H] which includes the inputs together with
+      the rotary position embedding incorporated in it.
     """
-    ret = 0
-    n = -relative_position
-    if bidirectional:
-      num_buckets //= 2
-      ret += (n < 0).astype(np.int32) * num_buckets
-      n = np.abs(n)
-    else:
-      n = np.maximum(n, 0)
-    # now n is in the range [0, inf)
-    max_exact = num_buckets // 2
-    is_small = n < max_exact
-    val_if_large = max_exact + (
-        np.log(n.astype(np.float32) / max_exact + np.finfo(np.float32).eps) /
-        np.log(max_distance / max_exact) *
-        (num_buckets - max_exact)).astype(np.int32)
-    val_if_large = np.minimum(val_if_large, num_buckets - 1)
-    ret += np.where(is_small, n, val_if_large)
-    return ret
+    if len(inputs.shape) != 4:
+      raise ValueError(
+          'Input is assumed to be a rank 4 tensor of shape'
+          '[batch, sequence, heads, dims].'
+      )
+    if self.embedding_dims != inputs.shape[3]:
+      raise ValueError(
+          'The embedding dims of the rotary position embedding'
+          'must match the hidden dimension of the inputs.'
+      )
+    half_embedding_dim = self.embedding_dims // 2
+    fraction = 2 * jnp.arange(0, half_embedding_dim) / self.embedding_dims
+    timescale = (
+        self.min_timescale
+        * (self.max_timescale / self.min_timescale) ** fraction
+    )
+    if position is None:
+      seq_length = inputs.shape[1]
+      position = jnp.arange(seq_length, dtype=jnp.float32)[jnp.newaxis, :]
+    position = position[:, :, jnp.newaxis, jnp.newaxis]
+    timescale = timescale[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+    sinusoid_inp = position / timescale
+    sin = jnp.sin(sinusoid_inp)
+    cos = jnp.cos(sinusoid_inp)
+    reshape_tensor = inputs.astype(jnp.float32).reshape(
+        *inputs.shape[:-1], -1, 2
+    )
+    first_half = reshape_tensor[..., 0]
+    second_half = reshape_tensor[..., 1]
+    first_part = first_half * cos - second_half * sin
+    second_part = second_half * cos + first_half * sin
+    if self.cast_as_fprop_dtype:
+      first_part = first_part.astype(self.fprop_dtype)
+      second_part = second_part.astype(self.fprop_dtype)
+    x_out = jnp.stack((first_part, second_part), axis=-1).reshape(
+        *first_part.shape[:-1], -1
+    )
+    return x_out
 
-  @nn.compact
-  def __call__(self, qlen, klen, bidirectional=True):
-    """Produce relative position embedding attention biases.
-
-    Args:
-      qlen: attention query length.
-      klen: attention key length.
-      bidirectional: whether to allow positive memory-query relative position
-        embeddings.
-
-    Returns:
-      output: `(1, len, q_len, k_len)` attention bias
-    """
-    # TODO: should we be computing this w. numpy as a program
-    # constant?
-    context_position = np.arange(qlen, dtype=jnp.int32)[:, None]
-    memory_position = np.arange(klen, dtype=jnp.int32)[None, :]
-    relative_position = memory_position - context_position  # shape (qlen, klen)
-    rp_bucket = self._relative_position_bucket(
-        relative_position,
-        bidirectional=bidirectional,
-        num_buckets=self.num_buckets,
-        max_distance=self.max_distance)
-    relative_attention_bias = self.param(
-        'rel_embedding',
-        withLP(self.embedding_init, ('heads', 'relpos_buckets')),
-        (self.num_heads, self.num_buckets),
-        jnp.float32)
-
-    relative_attention_bias = jnp.asarray(relative_attention_bias, self.dtype)
-    # Instead of using a slow gather, we create a leading-dimension one-hot
-    # array from rp_bucket and use it to perform the gather-equivalent via a
-    # contraction, i.e.:
-    # (num_head, num_buckets) x (num_buckets one-hot, qlen, klen).
-    # This is equivalent to relative_attention_bias[:, rp_bucket]
-    bcast_iota = lax.broadcasted_iota(jnp.int32, (self.num_buckets, 1, 1), 0)
-    rp_bucket_one_hot = jnp.array(
-        rp_bucket[jnp.newaxis, ...] == bcast_iota, dtype=self.dtype)
-    # --> shape (qlen, klen, num_heads)
-    values = lax.dot_general(
-        relative_attention_bias,
-        rp_bucket_one_hot,
-        (
-            ((1,), (0,)),  # rhs, lhs contracting dims
-            ((), ())))  # no batched dims
-    # Add a singleton batch dimension.
-    # --> shape (1, num_heads, qlen, klen)
-    return values[jnp.newaxis, ...]
 
 
 #------------------------------------------------------------------------------
@@ -942,7 +908,7 @@ def combine_biases(*masks: Optional[Array]):
 def make_decoder_mask(decoder_target_tokens: Array,
                       dtype: DType,
                       decoder_causal_attention: Optional[Array] = None,
-                      decoder_segment_ids: Optional[Array] = None) -> Array:
+                      decoder_segment_ids: Optional[Array] = None) -> Optional[Array]:
   """Compute the self-attention mask for a decoder.
 
   Decoder mask is formed by combining a causal mask, a padding mask and an
@@ -1052,22 +1018,14 @@ class DecoderLayer(nn.Module):
   @nn.compact
   def __call__(self,
                inputs,
+               decoder_segment_ids,
+               decoder_positions,
                decoder_mask,
                deterministic,
                decode,
                max_decode_length):
     cfg = self.config
     mesh = self.mesh
-    # Relative position embedding as attention biases.
-    l = max_decode_length if decode and max_decode_length else inputs.shape[-2]
-    decoder_bias = RelativePositionBiases(
-        num_buckets=32,
-        max_distance=128,
-        num_heads=cfg.num_heads,
-        dtype=cfg.dtype,
-        embedding_init=nn.initializers.variance_scaling(1.0, 'fan_avg',
-                                                        'uniform'),
-        name='relpos_bias')(l, l, False)
 
     inputs = nn.with_logical_constraint(inputs, ('activation_batch', 'activation_length', 'activation_embed'))
 
@@ -1088,8 +1046,11 @@ class DecoderLayer(nn.Module):
         mesh = mesh)(
             lnx,
             lnx,
-            decoder_mask,
-            decoder_bias,
+            enable_flash_attention=cfg.enable_flash_attention,
+            decoder_segment_ids=decoder_segment_ids,
+            inputs_positions=decoder_positions,
+            mask=decoder_mask,
+            bias = None,
             deterministic=deterministic,
             decode=decode)
     attention_lnx = nn.with_logical_constraint(attention_lnx, ('activation_batch', 'activation_length', 'activation_embed'))
@@ -1135,6 +1096,7 @@ class Decoder(nn.Module):
   @nn.compact
   def __call__(self,
                decoder_input_tokens,
+               decoder_segment_ids=None,
                decoder_positions=None,
                decoder_mask=None,
                deterministic=False,
@@ -1167,7 +1129,7 @@ class Decoder(nn.Module):
           BlockLayer,
           prevent_cse=not cfg.scan_layers,
           policy=policy,
-          static_argnums=(-1, -2, -3, -4))
+          static_argnums=(-1, -2, -3, -4, -5))
     if cfg.scan_layers:
       initializing = self.is_mutable_collection('params')
       params_spec = (
@@ -1186,11 +1148,11 @@ class Decoder(nn.Module):
               'aqt': cfg.int8_training
           },
           in_axes=(nn.broadcast, nn.broadcast, nn.broadcast,
-                   nn.broadcast),
+                   nn.broadcast, nn.broadcast, nn.broadcast),
           length=cfg.num_decoder_layers,
           metadata_params={nn.PARTITION_NAME: 'layers'})(
               config=cfg, mesh=mesh,
-              name='decoder')(y, decoder_mask,
+              name='decoder')(y, decoder_segment_ids, decoder_positions, decoder_mask,
                               deterministic, decode, max_decode_length)
     else:
       for lyr in range(cfg.num_decoder_layers):
@@ -1198,6 +1160,8 @@ class Decoder(nn.Module):
         y = BlockLayer(
             config=cfg, mesh = mesh, name=f'layers_{lyr}')(
                 y,
+                decoder_segment_ids,
+                decoder_positions,
                 decoder_mask,
                 deterministic,
                 decode,
@@ -1280,6 +1244,7 @@ class Transformer(nn.Module):
     logits = self.decoder(
         decoder_input_tokens=decoder_input_tokens,
         decoder_positions=decoder_positions,
+        decoder_segment_ids=decoder_segment_ids,
         decoder_mask=decoder_mask,
         deterministic=not enable_dropout,
         decode=decode,

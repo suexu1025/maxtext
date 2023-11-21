@@ -162,7 +162,7 @@ def get_datasets(
   # Training dataset.
   train_ds_builder = tfds.builder(config.dataset_name)
   # train_data = get_raw_dataset(train_ds_builder, 'train')
-  train_ds = train_ds_builder.as_dataset(split='train',
+  train_ds = train_ds_builder.as_dataset(split=config.train_split,
                                            read_config = read_config,
                                            shuffle_files=config.enable_data_shuffling)
   # shard the dataset as soon as it is loaded

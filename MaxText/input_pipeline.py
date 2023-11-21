@@ -32,6 +32,7 @@ import multihost_dataloading
 import sequence_packing
 
 from cnndm_data import make_cnndm_train_iterator_and_tokenizer
+from c4_data import make_c4_v304_train_iterator_and_tokenizer
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
 
@@ -305,7 +306,12 @@ def create_data_iterator_with_tokenizer(config, mesh):
   if config.dataset_type == "synthetic":
     return SyntheticDataIterator(config, mesh), None
   elif config.dataset_type == "c4":
-    return make_c4_train_iterator_and_tokenizer(config, mesh)
+    per_device_batch_size=1
+    train_ds, eval_ds = make_c4_v304_train_iterator_and_tokenizer(per_device_batch_size)
+    train_iter = multihost_dataloading.get_batch_sharded_data_pipeline(train_ds, mesh)
+    eval_iter = multihost_dataloading.get_batch_sharded_data_pipeline(eval_ds, mesh)
+    return train_iter, None #eval_iter
+    #return make_c4_v304_train_iterator_and_tokenizer(config, mesh)
   elif config.dataset_type == "cnndm":
     per_device_batch_size=1
     train_ds, eval_ds = make_cnndm_train_iterator_and_tokenizer(per_device_batch_size)

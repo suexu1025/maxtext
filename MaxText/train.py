@@ -258,8 +258,47 @@ def train_step(model, config, state, data, dropout_rng):
   (loss, aux), raw_grads = grad_fn(state.params)
   intermediate_outputs = aux['intermediate_outputs']
 
-  if config.gradient_clipping_threshold > 0:
-    grads, _ = optax.clip_by_global_norm(config.gradient_clipping_threshold).update(raw_grads, state, None)
+  # decimate proportion of data when per_device_batch_size<1
+  if is_train:
+    for k, v in data.items():
+      data[k] = v[:config.global_batch_size_to_train_on,:]
+
+  def loss_fn(params, is_train=True):
+    logits, intermediate_outputs = model.apply({'params': params},
+                         data['inputs'],
+                         data['inputs_position'],
+                         decoder_segment_ids=data['inputs_segmentation'],
+                         enable_dropout=config.enable_dropout if is_train else False,
+                         rngs={'dropout': rng1, 'aqt': aqt_rng}, mutable='intermediates')
+    one_hot_targets = jax.nn.one_hot(data['targets'], config.vocab_size)
+    xent = max_utils.compute_cross_entropy_with_logits(config, logits, one_hot_targets, 0.0)
+    xent = nn.with_logical_constraint(xent, ('activation_batch', 'activation_length'))
+    # Mask out paddings at the end of each example.
+    xent = xent * (data['targets_segmentation'] != 0)
+    total_loss = jnp.sum(xent)
+    total_weights = jnp.sum(data['targets_segmentation'] != 0)
+    loss = total_loss / (total_weights + EPS)
+    aux = {
+      'intermediate_outputs': intermediate_outputs,
+      'total_loss': total_loss,
+      'total_weights': total_weights,
+    }
+    return loss, aux
+
+  if is_train:
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, aux), raw_grads = grad_fn(state.params)
+    intermediate_outputs = aux['intermediate_outputs']
+
+    if config.gradient_clipping_threshold > 0:
+      grads, _ = optax.clip_by_global_norm(config.gradient_clipping_threshold).update(raw_grads, state, None)
+    else:
+      grads = raw_grads
+    new_state = state.apply_gradients(grads=grads)
+    # metrics = {'scalar': {'learning/loss': loss, 'learning/grad_norm': max_utils.l2norm_pytree(grads),
+    #           'learning/raw_grad_norm': max_utils.l2norm_pytree(raw_grads),
+    #           'learning/param_norm': max_utils.l2norm_pytree(new_state.params)}, 'scalars': {}}
+    metrics = {'scalar': {'learning/loss': loss}, 'scalars': {}}
   else:
     grads = raw_grads
   new_state = state.apply_gradients(grads=grads)
@@ -436,7 +475,12 @@ def train_loop(config, state=None):
       )
 
     new_time = datetime.datetime.now()
-    record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
+    step_time_delta = new_time - last_step_completion
+    max_logging.log(f"completed step: {step}, seconds: {step_time_delta.total_seconds()}, "
+          f"TFLOP/s/device: {per_device_tflops / step_time_delta.total_seconds()}, "
+          f"loss: {metrics['scalar']['learning/loss']:.3f}")
+    # record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
+    # write_metrics(writer, metrics, step, config)
     last_step_completion = new_time
 
     if checkpoint_manager is not None:

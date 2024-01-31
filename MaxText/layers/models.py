@@ -221,6 +221,8 @@ class Decoder(nn.Module):
         policy = jax.checkpoint_policies.save_only_these_names(
             'query_proj', 'value_proj', 'key_proj', 'qkv_proj',
         )
+      elif cfg.remat_policy == 'full':
+         policy = jax.checkpoint_policies.everything_saveable
       else:
         assert (
             cfg.remat_policy == 'full'

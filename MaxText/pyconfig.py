@@ -307,7 +307,7 @@ def calculate_global_batch_sizes(raw_keys):
   num_devices = get_num_target_devices(raw_keys)
   if per_device_batch_size < 1.0:
     # For per_device_batch_size<1, we load the data as if per_device_batch_size=1
-    global_batch_size_to_load = num_devices
+    global_batch_size_to_load = int(num_devices * per_device_batch_size)
   else:
     global_batch_size_to_load = int(num_devices * per_device_batch_size)
 

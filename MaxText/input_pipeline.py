@@ -497,13 +497,13 @@ def make_c4_mlperf_train_iterator_and_tokenizer(config, mesh, shuffle_buffer_siz
     skip_prefetch = True,
   )
 
-  assert jax.process_count() % 512 == 0
+  #assert jax.process_count() % 512 == 0
   train_read_config = tfds.ReadConfig(
     shuffle_seed = config.data_shuffle_seed,
     skip_prefetch = True,
     input_context = tf.distribute.InputContext(
-      input_pipeline_id=jax.process_index() * 512 // jax.process_count(),
-      num_input_pipelines=512,  # Total number of workers
+      input_pipeline_id=jax.process_index(),
+      num_input_pipelines=jax.process_count(),  # Total number of workers
     ),
   )
 

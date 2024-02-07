@@ -83,6 +83,7 @@ class DenseGeneral(nn.Module):
   kernel_axes: Tuple[str, ...] = ()
   use_int8: bool = False
   use_bias: bool = False
+  drhs: int = 1
   local_aqt_shards: int = 0
 
   @nn.compact
@@ -102,7 +103,7 @@ class DenseGeneral(nn.Module):
         return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
       else:
         aqt_rng = self.make_rng('aqt')
-        aqt_dot_general = quantizations.int8_dot_general(aqt_rng, self.local_aqt_shards)
+        aqt_dot_general = quantizations.int8_dot_general(aqt_rng, self.drhs, self.local_aqt_shards)
         return aqt_dot_general(
             inputs, kernel, ((axis, contract_ind), ((), ()))
         )

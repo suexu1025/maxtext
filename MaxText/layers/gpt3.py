@@ -155,6 +155,7 @@ class Gpt3MultiHeadAttention(nn.Module):
       name=proj_name,
       use_int8=self.use_int8,
       use_bias=self.use_bias,
+      drhs = 0, 
       local_aqt_shards=self.config.local_aqt_shards_qkv_proj
       )(inputs)
     qkv_proj = checkpoint_name(qkv_proj, 'qkv_proj')

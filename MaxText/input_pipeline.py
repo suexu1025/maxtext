@@ -579,6 +579,11 @@ def make_c4_mlperf_train_iterator_and_tokenizer(config, mesh, shuffle_buffer_siz
   else:
     eval_batch_size = global_batch_size_to_load
 
+  assert (
+        eval_batch_size >= 1
+    ), 'eval batch size < 1'
+ 
+  eval_batch_size = int(eval_batch_size)
   train_ds = train_ds.batch(global_batch_size_to_load // jax.process_count(), drop_remainder=True)
 
   # ensure array split in an equal division for each device

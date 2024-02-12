@@ -470,7 +470,7 @@ def create_data_iterator_with_tokenizer(config, mesh):
     return SyntheticDataIterator(config, mesh), None, None
   elif config.dataset_type == "c4":
     return make_c4_train_iterator_and_tokenizer(config, mesh)
-  elif config.dataset_type == "q":
+  elif config.dataset_type == "c4_mlperf":
     return make_c4_mlperf_train_iterator_and_tokenizer(config, mesh)
   else:
     assert False, "dataset type not implemented"

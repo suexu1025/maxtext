@@ -254,33 +254,20 @@ def train_step(model, config, state, data, dropout_rng):
 
   """
   train_loss_fn = functools.partial(loss_fn, model, config, data, dropout_rng, is_train=True)
+  grad_fn = jax.value_and_grad(train_loss_fn, has_aux=True)
+  (loss, aux), raw_grads = grad_fn(state.params)
+  intermediate_outputs = aux['intermediate_outputs']
 
-  # decimate proportion of data when per_device_batch_size<1
-  if is_train:
-    for k, v in data.items():
-      data[k] = v[:config.global_batch_size_to_train_on,:]
-
-  if is_train:
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, aux), raw_grads = grad_fn(state.params)
-    intermediate_outputs = aux['intermediate_outputs']
-
-    if config.gradient_clipping_threshold > 0:
-      grads, _ = optax.clip_by_global_norm(config.gradient_clipping_threshold).update(raw_grads, state, None)
-    else:
-      grads = raw_grads
-    new_state = state.apply_gradients(grads=grads)
-    # metrics = {'scalar': {'learning/loss': loss, 'learning/grad_norm': max_utils.l2norm_pytree(grads),
-    #           'learning/raw_grad_norm': max_utils.l2norm_pytree(raw_grads),
-    #           'learning/param_norm': max_utils.l2norm_pytree(new_state.params)}, 'scalars': {}}
-    metrics = {'scalar': {'learning/loss': loss}, 'scalars': {}}
+  if config.gradient_clipping_threshold > 0:
+    grads, _ = optax.clip_by_global_norm(config.gradient_clipping_threshold).update(raw_grads, state, None)
   else:
     grads = raw_grads
   new_state = state.apply_gradients(grads=grads)
-  metrics = {'scalar': {'learning/loss': loss, 'learning/grad_norm': max_utils.l2norm_pytree(grads),
-             'learning/raw_grad_norm': max_utils.l2norm_pytree(raw_grads),
-             'learning/param_norm': max_utils.l2norm_pytree(new_state.params)}, 'scalars': {}}
-
+  # metrics = {'scalar': {'learning/loss': loss, 'learning/grad_norm': max_utils.l2norm_pytree(grads),
+  #            'learning/raw_grad_norm': max_utils.l2norm_pytree(raw_grads),
+  #            'learning/param_norm': max_utils.l2norm_pytree(new_state.params)}, 'scalars': {}}
+  
+  metrics = {'scalar': {'learning/loss': loss}, 'scalars': {}}
   if config.record_internal_nn_metrics:
     record_activation_metrics(metrics, intermediate_outputs, config)
 
@@ -450,12 +437,7 @@ def train_loop(config, state=None):
       )
 
     new_time = datetime.datetime.now()
-    step_time_delta = new_time - last_step_completion
-    max_logging.log(f"completed step: {step}, seconds: {step_time_delta.total_seconds()}, "
-          f"TFLOP/s/device: {per_device_tflops / step_time_delta.total_seconds()}, "
-          f"loss: {metrics['scalar']['learning/loss']:.3f}")
-    # record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
-    # write_metrics(writer, metrics, step, config)
+    record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
     last_step_completion = new_time
 
     if checkpoint_manager is not None:
